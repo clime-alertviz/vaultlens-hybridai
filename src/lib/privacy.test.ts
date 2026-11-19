@@ -172,3 +172,11 @@ void test('preflight override controls outbound cloud prompt and App Check repor
     'active'
   );
 });
+
+void test('explicit empty and whitespace-only edits never restore document text in hybrid mode', () => {
+  for (const draft of ['', '   ']) {
+    const output = prepareCloudSafePrompt({ rawText: 'private sentence', redactedTextOverride: draft, choice: 'hybrid_prefer_local' });
+    assert.equal(output.outboundDocumentText, draft);
+    assert.ok(!output.promptText.includes('private sentence'));
+  }
+});

@@ -236,7 +236,7 @@ export function prepareCloudSafePrompt(params: {
 } {
   const redaction = redactSensitiveText(params.rawText);
   const scrubbedText =
-    typeof params.redactedTextOverride === 'string' && params.redactedTextOverride.trim().length > 0
+    typeof params.redactedTextOverride === 'string'
       ? params.redactedTextOverride
       : redaction.redactedText;
 
@@ -270,6 +270,9 @@ export async function analyzeDocumentHybrid(params: {
     redactedTextOverride: params.redactedTextOverride,
     choice: params.choice,
   });
+  if (params.choice !== 'strict_local' && !redaction.redactedText.trim()) {
+    throw new Error('Enter and approve the text to send before analyzing.');
+  }
   const baseline = extractDocumentHeuristics(params.text);
 
   // 1. Try Firebase AI Logic hybrid inference if configured

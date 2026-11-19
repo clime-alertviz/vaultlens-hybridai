@@ -150,7 +150,7 @@ export function App() {
             bic: 'CEKOCZPP',
             amountEur: 12,
             ref: '2026111701',
-            message: 'VaultLens Pro Pass',
+            message: 'VaultLens Pro Pass VS 2026111701',
             recipientName: 'Michal Novotny',
           })
         : buildSpdPaymentString({
@@ -167,12 +167,18 @@ export function App() {
 
   useEffect(() => {
     if (!showProModal) return;
-    void QRCode.toDataURL(spdString, { width: 220, margin: 1 }).then(setQrDataUrl);
+    let current = true;
+    setQrDataUrl('');
+    void QRCode.toDataURL(spdString, { width: 220, margin: 1 }).then(url => {
+      if (current) setQrDataUrl(url);
+    });
+    return () => { current = false; };
   }, [showProModal, spdString]);
 
+  const pendingApproval = routing !== 'strict_local' && (!preflightApproved || !preflightDraft.trim());
   const handleAnalyze = async () => {
     if (!inputText.trim() && !imageAttachment) return;
-    if (routing !== 'strict_local' && !preflightApproved) return;
+    if (pendingApproval) return;
     setRunning(true);
     try {
       const out = await analyzeDocumentHybrid({
@@ -569,7 +575,7 @@ export function App() {
 
             <button
               type="button"
-              disabled={running || (routing !== 'strict_local' && !preflightApproved)}
+              disabled={running || pendingApproval || (!inputText.trim() && !imageAttachment)}
               onClick={() => {
                 void handleAnalyze();
               }}
@@ -578,7 +584,7 @@ export function App() {
               <Sparkles className="h-4 w-4" />
               {running
                 ? 'Running Hybrid Inference...'
-                : routing !== 'strict_local' && !preflightApproved
+                : pendingApproval
                   ? 'Approve Preflight Payload Above to Run'
                   : 'Send Approved Payload & Analyze'}
             </button>
