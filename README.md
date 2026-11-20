@@ -1,12 +1,10 @@
-# VaultLens Hybrid AI
+# VaultLens AI
 
-**On-device structured PII redaction + hybrid Firebase AI Logic document & invoice copilot.**
-Built for **[#BuildHybridAI 2026](https://firebasehybridaihackathon.devpost.com/)** (`firebase@13.4.0` `firebase/ai`).
+Open a text PDF, XML or ISDOC invoice in the browser, review extracted fields and export the latest 20 results from the current session as CSV. Try the two built-in invoice files. For contracts, the app highlights clauses that merit a closer look. Files are read on the device. Scanned PDFs without a text layer require OCR outside this importer.
 
-- **Live Hosted Demo:** [https://alertviz.com/vaultlens/](https://alertviz.com/vaultlens/)
+Czech is the default language. The English interface is available at `?lang=en`. On-device processing is the default. When cloud processing is selected, the user reviews and approves the masked text before analysis.
 
-## Problem
-Freelancers, accountants, and small businesses paste invoices, NDAs, bank statements, and API credentials into cloud AI tools every day — leaking IBANs, local bank accounts, tax/personal IDs, phone numbers, and secrets to remote prompts while paying per-token cloud inference costs on routine documents.
+[Live app](https://alertviz.com/vaultlens/) · [English](https://alertviz.com/vaultlens/?lang=en)
 
 ## Solution & Hybrid AI Architecture
 ```

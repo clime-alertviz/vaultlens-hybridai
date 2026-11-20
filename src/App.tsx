@@ -1,18 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
-import QRCode from 'qrcode';
-import {
-  CheckCircle2,
-  Cloud,
-  Cpu,
-  Download,
-  FileText,
-  Lock,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  Upload,
-  Zap,
-} from 'lucide-react';
+import { useEffect, useMemo, useState, useRef, type ReactNode } from 'react';
+import {readDocument} from './lib/importDocument';
+import { ScanLine, LockKeyhole, Upload, ArrowRight, Download } from 'lucide-react';
 import {
   analyzeDocumentHybrid,
   checkChromeNanoAvailability,
@@ -24,15 +12,9 @@ import {
 } from './lib/hybridEngine';
 import {
   buildAccountingCsv,
-  buildSepaEpcPaymentString,
-  buildSpdPaymentString,
   redactSensitiveText,
-  SUPPORTED_PII_CATEGORIES,
   type ExtractedInvoice,
 } from './lib/privacy';
-
-const paymentIban = (import.meta.env.VITE_VAULTLENS_PAYMENT_IBAN ?? '').replace(/\s/g, '');
-const domesticAccount = import.meta.env.VITE_VAULTLENS_DOMESTIC_ACCOUNT ?? '';
 
 const SAMPLES: Array<{ label: string; text: string }> = [
   {
@@ -69,9 +51,34 @@ Internal key sample: sk-test-1234567890abcdef1234`,
 
 const STORAGE_CFG_KEY = 'vaultlens_firebase_cfg_v1';
 
+function Modal({title, onClose, children}: {title: string; onClose: () => void; children: ReactNode}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const el = dialog.current;
+    el?.showModal();
+    return () => el?.close();
+  }, []);
+  return <dialog ref={dialog} onCancel={onClose} aria-label={title}><h2>{title}</h2>{children}</dialog>;
+}
+
 export function App() {
+  const readCzech = () => new URLSearchParams(location.search).get('lang') !== 'en';
+  const [cs, setCs] = useState(readCzech);
+  const t = (en: string, cz: string) => cs ? cz : en;
+  useEffect(() => {
+    const restore = () => setCs(readCzech());
+    window.addEventListener('popstate',restore);
+    return () => window.removeEventListener('popstate',restore);
+  }, []);
+  useEffect(() => {
+    document.documentElement.lang = cs ? 'cs' : 'en';
+    document.title = cs ? 'VaultLens AI · Analýza dokumentů' : 'VaultLens AI · Document analysis';
+  }, [cs]);
+  const alternate = new URL(location.href);
+  if (cs) alternate.searchParams.set('lang','en'); else alternate.searchParams.delete('lang');
+  const [analysisError, setAnalysisError] = useState(false);
   const [inputText, setInputText] = useState<string>(SAMPLES[0]!.text);
-  const [routing, setRouting] = useState<RoutingChoice>('hybrid_prefer_local');
+  const [routing, setRouting] = useState<RoutingChoice>('strict_local');
   const baseRedaction = useMemo(() => redactSensitiveText(inputText), [inputText]);
   const [preflightDraft, setPreflightDraft] = useState<string>(() =>
     redactSensitiveText(SAMPLES[0]!.text).redactedText
@@ -85,32 +92,35 @@ export function App() {
   } | null>(null);
   const [running, setRunning] = useState<boolean>(false);
   const [result, setResult] = useState<AnalysisOutput | null>(null);
+  const resultHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (result) resultHeading.current?.focus();
+  }, [result]);
   const [savedBatch, setSavedBatch] = useState<
     Array<{ id: string; source: AnalysisOutput['source']; item: ExtractedInvoice }>
   >([]);
   const [chromeNanoStatus, setChromeNanoStatus] = useState<string>('checking');
-  const [showArchGuide, setShowArchGuide] = useState<boolean>(false);
   const [copiedFlag, setCopiedFlag] = useState<boolean>(false);
 
   const [showSettings, setShowSettings] = useState<boolean>(false);
-  const [showProModal, setShowProModal] = useState<boolean>(false);
-  const [proPayMode, setProPayMode] = useState<'czk' | 'sepa'>('czk');
-  const [qrDataUrl, setQrDataUrl] = useState<string>('');
-  const [cfgJsonInput, setCfgJsonInput] = useState<string>(() => {
+  const [importStatus,setImportStatus] = useState('');
+  const [reading,setReading] = useState(false);
+  const [savedConfig, setSavedConfig] = useState<string>(() => {
     try {
       return localStorage.getItem(STORAGE_CFG_KEY) ?? '';
     } catch {
       return '';
     }
   });
+  const [cfgJsonInput, setCfgJsonInput] = useState(savedConfig);
   const [cfgError, setCfgError] = useState<string>('');
 
   const firebaseConfig: FirebaseClientConfig | null = useMemo(() => {
     const envCfg = getEnvFirebaseConfig();
     if (envCfg) return envCfg;
-    if (!cfgJsonInput.trim()) return null;
+    if (!savedConfig.trim()) return null;
     try {
-      const parsed = JSON.parse(cfgJsonInput) as Partial<FirebaseClientConfig>;
+      const parsed = JSON.parse(savedConfig) as Partial<FirebaseClientConfig>;
       if (parsed.apiKey && parsed.projectId && parsed.appId) {
         return {
           apiKey: parsed.apiKey,
@@ -125,12 +135,12 @@ export function App() {
       // Handled when saving
     }
     return null;
-  }, [cfgJsonInput]);
+  }, [savedConfig]);
 
   useEffect(() => {
     setPreflightDraft(baseRedaction.redactedText);
     setPreflightApproved(false);
-  }, [baseRedaction.redactedText]);
+  }, [inputText, baseRedaction.redactedText]);
 
   const appCheckStatus = useMemo(
     () => getAppCheckStatus(firebaseConfig),
@@ -141,45 +151,12 @@ export function App() {
     void checkChromeNanoAvailability().then(setChromeNanoStatus);
   }, []);
 
-  const spdString = useMemo(
-    () => {
-      if (!paymentIban) return '';
-      return proPayMode === 'sepa'
-        ? buildSepaEpcPaymentString({
-            iban: paymentIban,
-            bic: 'CEKOCZPP',
-            amountEur: 12,
-            ref: '2026111701',
-            message: 'VaultLens Pro Pass VS 2026111701',
-            recipientName: 'Michal Novotny',
-          })
-        : buildSpdPaymentString({
-            iban: paymentIban,
-            bic: 'CEKOCZPP',
-            amountCzk: 299,
-            vs: '2026111701',
-            message: 'VaultLens Pro Pass',
-            recipientName: 'Michal Novotny',
-          });
-    },
-    [proPayMode]
-  );
-
-  useEffect(() => {
-    if (!showProModal) return;
-    let current = true;
-    setQrDataUrl('');
-    void QRCode.toDataURL(spdString, { width: 220, margin: 1 }).then(url => {
-      if (current) setQrDataUrl(url);
-    });
-    return () => { current = false; };
-  }, [showProModal, spdString]);
-
   const pendingApproval = routing !== 'strict_local' && (!preflightApproved || !preflightDraft.trim());
   const handleAnalyze = async () => {
     if (!inputText.trim() && !imageAttachment) return;
     if (pendingApproval) return;
     setRunning(true);
+    setAnalysisError(false);
     try {
       const out = await analyzeDocumentHybrid({
         text: inputText,
@@ -199,11 +176,30 @@ export function App() {
         },
         ...prev.slice(0, 19),
       ]);
+    } catch {
+      setAnalysisError(true);
     } finally {
       setRunning(false);
     }
   };
 
+  const importFile = async (file:File) => {
+          setReading(true);setImportStatus(t('Reading file…','Načítám soubor…'));
+          try {const text=await readDocument(file);setInputText(text);setImageAttachment(null);setResult(null);setPreflightApproved(false);setImportStatus(file.name);}
+          catch(err){const reason=err instanceof Error?err.message:'';
+            setImportStatus(reason==='scan'?t('This PDF contains only images. Open a PDF with selectable text.','Toto PDF obsahuje pouze obrázky. Vyberte PDF s textovou vrstvou.'):
+              reason==='size'?t('Choose a smaller document (12 MB, 75 pages, 500,000 characters).','Zvolte menší dokument (12 MB, 75 stran, 500 000 znaků).'):
+              t('Could not read the document. Check its format or remove PDF password protection.','Dokument se nepodařilo přečíst. Zkontrolujte formát nebo odemkněte PDF.'));}
+          finally {setReading(false);}
+  };
+  const openExample = async (type:'pdf'|'xml') => {
+    try {
+      setReading(true);
+      const r=await fetch(import.meta.env.BASE_URL+'examples/faktura.'+type);
+      if(!r.ok) throw Error();
+      await importFile(new File([await r.blob()],'faktura.'+type));
+    } catch {setImportStatus(t('Could not load sample.','Vzor se nepodařilo načíst.'));setReading(false);}
+  };
   const handleImageUpload = (file: File | undefined) => {
     if (!file) return;
     const reader = new FileReader();
@@ -242,7 +238,8 @@ export function App() {
 
   const handleSaveConfig = () => {
     if (!cfgJsonInput.trim()) {
-      localStorage.removeItem(STORAGE_CFG_KEY);
+      try { localStorage.removeItem(STORAGE_CFG_KEY); } catch { /* Session only. */ }
+      setSavedConfig('');
       setCfgError('');
       setShowSettings(false);
       return;
@@ -250,626 +247,103 @@ export function App() {
     try {
       const parsed = JSON.parse(cfgJsonInput) as Partial<FirebaseClientConfig>;
       if (!parsed.apiKey || !parsed.projectId || !parsed.appId) {
-        setCfgError('JSON must include apiKey, projectId, and appId.');
+        setCfgError(t('Include apiKey, projectId and appId.', 'Doplňte apiKey, projectId a appId.'));
         return;
       }
-      localStorage.setItem(STORAGE_CFG_KEY, cfgJsonInput.trim());
+      try { localStorage.setItem(STORAGE_CFG_KEY, cfgJsonInput.trim()); } catch { /* Session only. */ }
+      setSavedConfig(cfgJsonInput.trim());
       setCfgError('');
       setShowSettings(false);
     } catch {
-      setCfgError('Invalid JSON format.');
+      setCfgError(t('Invalid JSON format.', 'Neplatný formát JSON.'));
     }
   };
 
-  const totalSavedUsd = useMemo(
-    () => (savedBatch.length * 0.0004).toFixed(4),
-    [savedBatch.length]
-  );
-
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      {/* Top Navbar */}
-      <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-3">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-400 text-slate-950 shadow">
-              <ShieldCheck className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-base font-extrabold tracking-tight text-white">
-                  VaultLens Hybrid AI
-                </h1>
-                <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-300 ring-1 ring-emerald-500/30">
-                  Firebase AI Logic
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                On-Device PII Redaction + Cloud Fallback Document Desk
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-300">
-              App Check:{' '}
-              <strong
-                className={
-                  appCheckStatus === 'active'
-                    ? 'text-emerald-400'
-                    : appCheckStatus === 'missing_site_key'
-                      ? 'text-amber-300'
-                      : 'text-slate-400'
-                }
-              >
-                {appCheckStatus === 'active'
-                  ? 'ReCaptchaV3 Active'
-                  : appCheckStatus === 'missing_site_key'
-                    ? 'Site Key Needed'
-                    : 'Local Only'}
-              </strong>
-            </span>
-            <span className="rounded-lg border border-slate-800 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-300">
-              Chrome Nano:{' '}
-              <strong
-                className={
-                  chromeNanoStatus === 'available' || chromeNanoStatus === 'readily'
-                    ? 'text-emerald-400'
-                    : 'text-amber-300'
-                }
-              >
-                {chromeNanoStatus}
-              </strong>
-            </span>
-            <button
-              type="button"
-              onClick={() => setShowArchGuide((v) => !v)}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-cyan-300 hover:bg-slate-700"
-            >
-              <Cpu className="h-3.5 w-3.5" />
-              {showArchGuide ? 'Hide Architecture' : 'Hybrid Architecture'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowSettings(true)}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700"
-            >
-              <Settings className="h-3.5 w-3.5" />
-              {firebaseConfig ? 'Firebase Connected' : 'Setup Firebase'}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                if (paymentIban) setShowProModal(true);
-                else window.open('https://alertviz.com/vaultlens/', '_blank', 'noopener,noreferrer');
-              }}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-gradient-to-r from-amber-400 to-emerald-400 px-3 py-1.5 text-xs font-black text-slate-950 shadow hover:brightness-105"
-            >
-              <Zap className="h-3.5 w-3.5" />
-              Pro Batch Pass (299 CZK)
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {showArchGuide && (
-        <section className="mx-auto mt-4 max-w-6xl px-4">
-          <div className="rounded-2xl border border-cyan-500/30 bg-slate-900/80 p-4 shadow-lg">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-cyan-300">
-                Client-Redacted Hybrid Pipeline (#BuildHybridAI 2026)
-              </h2>
-              <button
-                type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText('chrome://flags/#prompt-api-for-gemini-nano');
-                  setCopiedFlag(true);
-                  setTimeout(() => setCopiedFlag(false), 1800);
-                }}
-                className="cursor-pointer rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-200 hover:bg-cyan-500/20"
-              >
-                {copiedFlag
-                  ? 'Copied chrome://flags URL!'
-                  : 'Copy chrome://flags/#prompt-api-for-gemini-nano'}
-              </button>
-            </div>
-            <div className="mt-3 grid gap-2 text-xs text-slate-300 md:grid-cols-3">
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-                <div className="font-bold text-white">1. On-Device PII Vault</div>
-                <p className="mt-1 text-[11px] text-slate-400">
-                  IBANs, Czech accounts, IDs, emails, phones, and API keys are masked in RAM before any network call.
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-                <div className="font-bold text-white">2. Firebase AI Logic Router</div>
-                <p className="mt-1 text-[11px] text-slate-400">
-                  Switches live between <code className="text-cyan-300">ONLY_ON_DEVICE</code>,{' '}
-                  <code className="text-cyan-300">PREFER_ON_DEVICE</code>, and masked{' '}
-                  <code className="text-cyan-300">PREFER_IN_CLOUD</code> (Gemini 2.5 Flash).
-                </p>
-              </div>
-              <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-                <div className="font-bold text-white">3. Local Restore &amp; Batch Export</div>
-                <p className="mt-1 text-[11px] text-slate-400">
-                  Placeholders stay masked across cloud inference and rehydrate only inside your browser for Accounting CSV export.
-                </p>
-              </div>
-            </div>
-          </div>
-        </section>
-      )}
-
-      <main className="mx-auto grid max-w-6xl gap-5 px-4 py-6 lg:grid-cols-12">
-        {/* Left Column: Input + Routing */}
-        <section className="flex flex-col gap-4 lg:col-span-6">
-          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 shadow-xl">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-300">
-                <FileText className="h-4 w-4 text-cyan-400" />
-                Sensitive Document Input
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-                {SAMPLES.map((s) => (
-                  <button
-                    key={s.label}
-                    type="button"
-                    onClick={() => setInputText(s.text)}
-                    className="cursor-pointer rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-cyan-500/50 hover:text-white"
-                  >
-                    {s.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <textarea
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              rows={9}
-              placeholder="Paste invoice, NDA, receipt, or Czech bank statement here..."
-              className="w-full rounded-xl border border-slate-700/80 bg-slate-950 p-3 font-mono text-xs text-slate-100 placeholder:text-slate-600 focus:border-cyan-400 focus:outline-none"
-            />
-
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-              <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-dashed border-slate-700 bg-slate-950/60 px-3 py-1.5 text-xs text-slate-300 hover:border-cyan-400">
-                <Upload className="h-3.5 w-3.5 text-cyan-400" />
-                {imageAttachment ? imageAttachment.name : 'Attach Receipt / Invoice Image (Strict Local Only)'}
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg"
-                  className="hidden"
-                  onChange={(e) => handleImageUpload(e.target.files?.[0])}
-                />
-              </label>
-              {imageAttachment && (
-                <div className="flex items-center gap-2">
-                  <img
-                    src={imageAttachment.previewUrl}
-                    alt={imageAttachment.name}
-                    className="h-9 w-9 rounded-lg border border-slate-700 object-cover"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setImageAttachment(null)}
-                    className="cursor-pointer text-xs text-rose-400 hover:underline"
-                  >
-                    Remove image
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="mt-1.5 rounded-xl border border-slate-800 bg-slate-950/70 p-2.5 text-[11px] leading-snug text-slate-400">
-              <div className="font-semibold text-slate-300">Auto-Masked Identifier Scope:</div>
-              <ul className="mt-1 list-disc space-y-0.5 pl-4">
-                {SUPPORTED_PII_CATEGORIES.map((cat) => (
-                  <li key={cat}>{cat}</li>
-                ))}
-              </ul>
-              <div className="mt-1 text-amber-300/90">
-                Not auto-masked: unstructured names, street addresses, amounts, or custom secrets — edit the preflight payload below before allowing cloud routing. Receipt images stay on-device only (<code>ONLY_ON_DEVICE</code>).
-              </div>
-            </div>
-
-            {/* Editable Preflight Redaction Boundary BEFORE any network inference */}
-            <div className="mt-4 rounded-xl border border-cyan-500/30 bg-slate-950/80 p-3">
-              <div className="mb-1.5 flex items-center justify-between gap-2">
-                <label
-                  htmlFor="preflightPayload"
-                  className="text-[11px] font-bold uppercase tracking-wider text-cyan-300"
-                >
-                  Preflight Cloud-Safe Payload (Editable Before Dispatch)
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-slate-400">
-                    {baseRedaction.piiCount} auto-masked token(s)
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPreflightDraft(baseRedaction.redactedText);
-                      setPreflightApproved(false);
-                    }}
-                    className="cursor-pointer rounded border border-slate-700 bg-slate-800 px-2 py-0.5 text-[10px] font-semibold text-slate-200 hover:border-cyan-400"
-                  >
-                    Reset Scrub
-                  </button>
-                </div>
-              </div>
-              <textarea
-                id="preflightPayload"
-                value={preflightDraft}
-                onChange={(e) => {
-                  setPreflightDraft(e.target.value);
-                  setPreflightApproved(false);
-                }}
-                rows={5}
-                className="w-full rounded-lg border border-slate-800 bg-slate-900/80 p-2 font-mono text-[11px] text-slate-200 focus:border-cyan-400 focus:outline-none"
-              />
-              {routing !== 'strict_local' && (
-                <label className="mt-2 flex cursor-pointer items-start gap-2 text-[11px] text-slate-300">
-                  <input
-                    type="checkbox"
-                    checked={preflightApproved}
-                    onChange={(e) => setPreflightApproved(e.target.checked)}
-                    className="mt-0.5 h-3.5 w-3.5 accent-emerald-400"
-                  />
-                  <span>
-                    I reviewed and edited the preflight payload above; approve sending only this redacted text if inference falls back to cloud.
-                  </span>
-                </label>
-              )}
-            </div>
-
-            {/* Inference Routing Selector */}
-            <div className="mt-4">
-              <div className="mb-1.5 text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                Firebase AI Logic Inference Mode
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                {(
-                  [
-                    {
-                      id: 'strict_local',
-                      title: 'Strict Local',
-                      sub: 'ONLY_ON_DEVICE',
-                      icon: Lock,
-                    },
-                    {
-                      id: 'hybrid_prefer_local',
-                      title: 'Hybrid Smart',
-                      sub: 'PREFER_ON_DEVICE',
-                      icon: Cpu,
-                    },
-                    {
-                      id: 'prefer_cloud',
-                      title: 'Cloud Masked',
-                      sub: 'PREFER_IN_CLOUD',
-                      icon: Cloud,
-                    },
-                  ] as const
-                ).map((mode) => {
-                  const Icon = mode.icon;
-                  const active = routing === mode.id;
-                  return (
-                    <button
-                      key={mode.id}
-                      type="button"
-                      onClick={() => {
-                        setRouting(mode.id);
-                        if (mode.id !== 'strict_local') setPreflightApproved(false);
-                      }}
-                      className={`flex cursor-pointer flex-col items-start rounded-xl border p-2.5 text-left transition ${
-                        active
-                          ? 'border-cyan-400 bg-cyan-500/10 text-white'
-                          : 'border-slate-800 bg-slate-950/60 text-slate-400 hover:border-slate-700'
-                      }`}
-                    >
-                      <Icon className="mb-1 h-4 w-4 text-cyan-400" />
-                      <span className="text-xs font-bold">{mode.title}</span>
-                      <span className="font-mono text-[9px] text-slate-400">{mode.sub}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <button
-              type="button"
-              disabled={running || pendingApproval || (!inputText.trim() && !imageAttachment)}
-              onClick={() => {
-                void handleAnalyze();
-              }}
-              className="mt-4 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-emerald-400 py-2.5 text-sm font-black text-slate-950 shadow-lg transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Sparkles className="h-4 w-4" />
-              {running
-                ? 'Running Hybrid Inference...'
-                : pendingApproval
-                  ? 'Approve Preflight Payload Above to Run'
-                  : 'Send Approved Payload & Analyze'}
-            </button>
-          </div>
-        </section>
-
-        {/* Right Column: Telemetry, Redaction Vault, Extracted Fields */}
-        <section className="flex flex-col gap-4 lg:col-span-6">
-          {!result ? (
-            <div className="flex h-full min-h-[340px] flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800 bg-slate-900/30 p-6 text-center">
-              <ShieldCheck className="mb-3 h-10 w-10 text-emerald-400/70" />
-              <h2 className="text-sm font-bold text-slate-200">
-                Ready for Redacted Hybrid Analysis
-              </h2>
-              <p className="mt-1 max-w-sm text-xs text-slate-400">
-                Supported IBANs, Czech account numbers, IDs, emails, phones, and API keys are masked
-                locally in your editable preflight payload before cloud fallback; receipt photos stay
-                on-device only. Review the preflight box and click{' '}
-                <strong className="text-cyan-300">Send Approved Payload &amp; Analyze</strong>.
-              </p>
-            </div>
-          ) : (
-            <>
-              {/* Telemetry Strip */}
-              <div className="grid grid-cols-3 gap-2.5">
-                <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-                  <div className="text-[10px] font-bold uppercase text-slate-400">Execution</div>
-                  <div className="mt-0.5 text-xs font-extrabold text-emerald-300">
-                    {result.source.replace(/_/g, ' ')}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-                  <div className="text-[10px] font-bold uppercase text-slate-400">
-                    Matched Tokens
-                  </div>
-                  <div className="mt-0.5 text-xs font-extrabold text-cyan-300">
-                    {result.redaction.piiCount} pattern(s)
-                  </div>
-                </div>
-                <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-                  <div className="text-[10px] font-bold uppercase text-slate-400">
-                    Latency / Saved
-                  </div>
-                  <div className="mt-0.5 text-xs font-extrabold text-amber-300">
-                    {result.latencyMs}ms • ${totalSavedUsd}
-                  </div>
-                </div>
-              </div>
-
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
-                <CheckCircle2 className="mr-1.5 inline h-4 w-4 text-emerald-400" />
-                {result.note}
-              </div>
-
-              {/* Extracted Structured Data */}
-              <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                    Extracted Record ({result.extracted.documentKind})
-                  </h2>
-                  <button
-                    type="button"
-                    onClick={handleExportCsv}
-                    className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-slate-800 px-2.5 py-1 text-xs font-semibold text-cyan-300 hover:bg-slate-700"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    Export CSV ({savedBatch.length})
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  {(
-                    [
-                      ['Vendor / Party', result.extracted.vendor],
-                      ['IČO', result.extracted.ico ?? '—'],
-                      ['Amount', `${result.extracted.amount ?? '—'} ${result.extracted.currency ?? ''}`.trim()],
-                      ['Due Date', result.extracted.dueDate ?? '—'],
-                      ['IBAN', result.extracted.iban ?? '—'],
-                    ] as const
-                  ).map(([k, v]) => (
-                    <div key={k} className="rounded-lg bg-slate-950/70 p-2">
-                      <div className="text-[10px] text-slate-400">{k}</div>
-                      <div className="truncate font-mono font-semibold text-slate-100">{v}</div>
-                    </div>
-                  ))}
-                </div>
-
-                <p className="mt-3 text-xs text-slate-300">{result.extracted.summary}</p>
-
-                {result.extracted.riskFlags.length > 0 && (
-                  <div className="mt-3 space-y-1">
-                    {result.extracted.riskFlags.map((flag, i) => (
-                      <div
-                        key={i}
-                        className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-200"
-                      >
-                        ⚠ {flag}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Local Redaction Preview */}
-              <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                    Cloud-Safe Redacted Payload
-                  </span>
-                  <span className="text-[11px] text-slate-400">
-                    {result.redaction.entries.length} sensitive item(s) masked
-                  </span>
-                </div>
-                <pre className="max-h-36 overflow-auto rounded-xl bg-slate-950 p-3 font-mono text-[11px] text-slate-300">
-                  {result.redaction.redactedText}
-                </pre>
-              </div>
-
-              {savedBatch.length > 0 && (
-                <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                      Processed Batch Ledger ({savedBatch.length})
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setSavedBatch([])}
-                      className="cursor-pointer text-[11px] text-rose-400 hover:underline"
-                    >
-                      Clear batch
-                    </button>
-                  </div>
-                  <div className="max-h-40 overflow-auto rounded-xl border border-slate-800 bg-slate-950">
-                    <table className="w-full text-left font-mono text-[11px]">
-                      <thead className="border-b border-slate-800 text-[10px] text-slate-400">
-                        <tr>
-                          <th className="px-2.5 py-1.5">Vendor</th>
-                          <th className="px-2 py-1.5">Kind</th>
-                          <th className="px-2 py-1.5">Amount</th>
-                          <th className="px-2 py-1.5 text-right">Due</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/70">
-                        {savedBatch.map((row) => (
-                          <tr key={row.id} className="text-slate-200">
-                            <td className="max-w-[140px] truncate px-2.5 py-1.5">
-                              {row.item.vendor}
-                            </td>
-                            <td className="px-2 py-1.5 text-cyan-300">
-                              {row.item.documentKind}
-                            </td>
-                            <td className="px-2 py-1.5">
-                              {row.item.amount ? `${row.item.amount} ${row.item.currency ?? ''}`.trim() : '—'}
-                            </td>
-                            <td className="px-2 py-1.5 text-right text-slate-400">
-                              {row.item.dueDate ?? '—'}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </section>
-      </main>
-
-      {/* Firebase Config Modal */}
-      {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
-          <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-5 shadow-2xl">
-            <h2 className="text-sm font-bold text-white">Connect Firebase AI Logic</h2>
-            <p className="mt-1 text-xs text-slate-400">
-              Paste your Firebase Web App config JSON (from Firebase Console → Project Settings), plus optional{' '}
-              <code className="text-cyan-300">appCheckSiteKey</code> (reCAPTCHA v3) and{' '}
-              <code className="text-cyan-300">appCheckDebugToken</code> for App Check enforcement. Stored locally in your browser only.
-            </p>
-            <textarea
-              value={cfgJsonInput}
-              onChange={(e) => setCfgJsonInput(e.target.value)}
-              rows={6}
-              placeholder='{"apiKey":"...","projectId":"...","appId":"...","appCheckSiteKey":"..."}'
-              className="mt-3 w-full rounded-xl border border-slate-700 bg-slate-950 p-2.5 font-mono text-xs text-slate-100"
-            />
-            {cfgError && <p className="mt-1 text-xs text-rose-400">{cfgError}</p>}
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setShowSettings(false)}
-                className="cursor-pointer rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-300"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveConfig}
-                className="cursor-pointer rounded-lg bg-cyan-400 px-3 py-1.5 text-xs font-black text-slate-950"
-              >
-                Save Config
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Czech QR Platba / Pro Licensing Modal */}
-      {showProModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
-          <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-5 shadow-2xl">
-            <h2 className="text-base font-extrabold text-white">
-              VaultLens Pro Batch Pass — 299 CZK / €12 EUR
-            </h2>
-            <p className="mt-1 text-xs text-slate-300">
-              One-time Founder license for unlimited batch CSV accounting exports, custom Czech/EU
-              contract rulebooks, and priority support. Zero card fees via instant Czech QR Platba
-              or European SEPA EPC QR:
-            </p>
-
-            <div className="mt-2.5 flex gap-2">
-              <button
-                type="button"
-                onClick={() => setProPayMode('czk')}
-                className={`flex-1 cursor-pointer rounded-lg px-2.5 py-1.5 text-xs font-bold ${proPayMode === 'czk' ? 'bg-cyan-400 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
-              >
-                CZ QR Platba (299 CZK)
-              </button>
-              <button
-                type="button"
-                onClick={() => setProPayMode('sepa')}
-                className={`flex-1 cursor-pointer rounded-lg px-2.5 py-1.5 text-xs font-bold ${proPayMode === 'sepa' ? 'bg-emerald-400 text-slate-950' : 'bg-slate-800 text-slate-300'}`}
-              >
-                EU SEPA EPC QR (€12.00)
-              </button>
-            </div>
-
-            <div className="mt-3 flex flex-col items-center rounded-xl bg-white p-3 text-slate-900">
-              {qrDataUrl && (
-                <img
-                  src={qrDataUrl}
-                  alt={proPayMode === 'sepa' ? 'EU SEPA EPC QR' : 'Czech QR Platba SPD'}
-                  className="h-44 w-44"
-                />
-              )}
-              <div className="mt-2 text-center font-mono text-[11px]">
-                <div>
-                  <strong>{domesticAccount}</strong>
-                </div>
-                <div>IBAN: {paymentIban.match(/.{1,4}/g)?.join(' ')}</div>
-                <div>
-                  BIC: CEKOCZPP • Amount: {proPayMode === 'sepa' ? '€12.00 EUR' : '299 CZK'} • Ref:
-                  2026111701
-                </div>
-                <div className="text-slate-600">Michal Novotný • IČO: 01346521 (Neplátce DPH)</div>
-              </div>
-            </div>
-
-            <p className="mt-2.5 text-[11px] text-slate-400">
-              After scanning with your Czech banking app or sending SEPA EUR (€12), email your VS
-              reference to <strong className="text-cyan-300">info@alertviz.com</strong> to receive
-              your Pro unlock pack &amp; invoice.
-            </p>
-
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText(paymentIban);
-                }}
-                className="cursor-pointer rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700"
-              >
-                Copy IBAN
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowProModal(false)}
-                className="cursor-pointer rounded-lg bg-emerald-400 px-3 py-1.5 text-xs font-black text-slate-950"
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+  const openSettings = () => {
+    setCfgJsonInput(savedConfig);
+    setCfgError('');
+    setShowSettings(true);
+  };
+  const sampleNames = [t('Invoice','Faktura'), t('Contract','Smlouva'), t('Bank statement','Výpis z účtu')];
+  const kinds = {invoice: sampleNames[0], contract: sampleNames[1], statement: sampleNames[2], general: t('Document','Dokument')};
+  const sourceNames: Record<AnalysisOutput['source'], string> = {
+    local_deterministic: t('Local parser','Lokální rozpoznávání'),
+    firebase_in_cloud: t('Firebase cloud','Firebase v cloudu'),
+    firebase_on_device: 'Firebase · Gemini Nano',
+    chrome_builtin_ai: 'Chrome · Gemini Nano',
+  };
+  const modes: [RoutingChoice,string][] = [['strict_local',t('On device only','Pouze v zařízení')], ['hybrid_prefer_local',t('Prefer on device','Přednostně v zařízení')], ['prefer_cloud',t('Prefer cloud','Přednostně v cloudu')]];
+  const flagTranslations: Record<string,string> = {
+    'Auto-renewal clause detected — review cancellation notice window.':'Smlouva se automaticky prodlužuje. Zkontrolujte výpovědní lhůtu.',
+    'Broad liability / indemnification language present.':'Dokument obsahuje široce vymezenou odpovědnost nebo náhradu škody.',
+    'Late fee or contractual penalty clause detected.':'Dokument obsahuje ustanovení o poplatku za prodlení nebo smluvní pokutě.',
+    'Exclusivity / non-compete restriction flagged.':'Dokument obsahuje omezení týkající se výhradnosti nebo konkurence.',
+  };
+  const hub = cs ? '/hub/' : '/hub/en/';
+  return <>
+    <a className="skip" href="#document">{t('Skip to document','Přejít k dokumentu')}</a>
+    <header className="site-head"><div className="wrap head-row">
+      <a className="wordmark" href={cs ? './' : '?lang=en'}><ScanLine aria-hidden="true"/>VaultLens AI</a>
+      <nav className="nav"><a href="#settings">{t('Settings','Nastavení')}</a>
+        <a href={hub}>{t('Suite Hub','Přehled nástrojů')}</a>
+        <a className="language" href={alternate.href} hrefLang={cs?'en':'cs'} lang={cs?'en':'cs'} onClick={e=>{
+          if(e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+          e.preventDefault(); history.pushState(null,'',alternate); setCs(!cs);
+        }}>{t('Česky','English')}</a></nav>
+    </div></header>
+    <main><section className="hero-band"><div className="wrap vault-intro">
+      <h1>{t('Review documents','Prověřte dokumenty')}<br/><em>{t('with private data.','s citlivými údaji.')}</em></h1>
+      <p>{t('Open a text PDF or XML invoice, review its amount and due date, and export CSV. For contracts, review flagged clauses. You choose what can go to the cloud.',
+        'Otevřete fakturu v PDF nebo XML, zkontrolujte částku a splatnost a exportujte výsledek do CSV. U smluv zvýrazníme ustanovení ke kontrole. Identifikátory se maskují v prohlížeči. Vy určíte, co se smí odeslat do cloudu.')}</p>
+    </div></section>
+    <div className="wrap desk">
+      <section className="panel"><h2><label htmlFor="document">{t('Source document','Zdrojový dokument')}</label></h2>
+        <div className="samples"><span>{t('Samples','Vzory')}</span>{SAMPLES.map((sample,i)=><button type="button" className="secondary" key={sample.label} aria-pressed={inputText===sample.text} disabled={running || reading} onClick={()=>setInputText(sample.text)}>{sampleNames[i]}</button>)}</div>
+        <div className="samples"><button className="secondary" disabled={reading || running} onClick={()=>openExample('pdf')}>{t('Try a PDF invoice','Vyzkoušet fakturu PDF')}</button><button className="secondary" disabled={reading || running} onClick={()=>openExample('xml')}>{t('Try an XML invoice','Vyzkoušet fakturu XML')}</button></div>
+        <textarea id="document" rows={10} value={inputText} disabled={running || reading} onChange={e=>setInputText(e.target.value)} spellCheck={false}/>
+        <label className="upload"><Upload size={16}/>{t('Open PDF or XML / ISDOC','Otevřít PDF nebo XML / ISDOC')}<input type="file" accept=".pdf,.xml,.isdoc,application/pdf,text/xml,application/xml" disabled={running||reading} onChange={async e=>{
+          const file=e.target.files?.[0]; e.target.value=''; if(!file)return;
+          await importFile(file);
+        }}/></label><p className="subtle" role="status">{importStatus || t('Read locally. Text PDFs and XML invoices are supported.','Soubor se načte v prohlížeči. Podporujeme textová PDF a faktury XML včetně ISDOC.')}</p>
+        <label className="upload"><Upload size={16}/>{t('Attach an image','Přiložit obrázek')}<input type="file" accept="image/jpeg,image/png" disabled={running || reading} onChange={e=>handleImageUpload(e.target.files?.[0])}/></label>
+        {imageAttachment && <div className="attachment"><img src={imageAttachment.previewUrl} alt=""/><span>{imageAttachment.name}</span><button className="secondary" disabled={running || reading} onClick={()=>setImageAttachment(null)}>{t('Remove','Odebrat')}</button></div>}
+        <p className="subtle">{t('Receipt images are used only for on-device analysis.','Obrázky dokladů se analyzují pouze ve vašem zařízení.')}</p>
+      </section>
+      <section className="panel review"><div className="review-head"><h2><label htmlFor="preflightPayload">{t('Review masked text','Kontrola maskování')}</label></h2><LockKeyhole size={20}/></div>
+        <p>{t('Check names, addresses, amounts and any other details you want to remove. Edit the text before approving it.','Zkontrolujte jména, adresy, částky a další údaje, které chcete odstranit. Před schválením můžete text upravit.')}</p>
+        <textarea id="preflightPayload" rows={6} spellCheck={false} value={preflightDraft} disabled={running || reading} onChange={e=>{setPreflightDraft(e.target.value);setPreflightApproved(false);}}/>
+        <div className="mask-row"><span>{t('Masked identifiers','Maskované identifikátory')} · {baseRedaction.piiCount}</span><button disabled={running || reading} className="secondary" onClick={()=>{setPreflightDraft(baseRedaction.redactedText);setPreflightApproved(false);}}>{t('Reset edits','Obnovit maskování')}</button></div>
+        <label className="field-label" htmlFor="route">{t('Processing mode','Způsob zpracování')}</label>
+        <select id="route" value={routing} disabled={running || reading} onChange={e=>{setRouting(e.target.value as RoutingChoice);setPreflightApproved(false);}}>{modes.map(([id,label])=><option key={id} value={id}>{label}</option>)}</select>
+        {routing !== 'strict_local' && <label className="consent"><input type="checkbox" checked={preflightApproved} disabled={running || reading} onChange={e=>setPreflightApproved(e.target.checked)}/>{t('I approve the text above for cloud processing.','Schvaluji výše uvedený text pro zpracování v cloudu.')}</label>}
+        <button className="analyze" aria-describedby={pendingApproval ? 'approval-hint' : undefined} id="analyze" disabled={reading || running || pendingApproval || (!inputText.trim()&&!imageAttachment)} onClick={handleAnalyze}>{running?t('Analyzing…','Zpracovává se…'):t('Analyze document','Analyzovat dokument')} <ArrowRight size={18}/></button>
+        {pendingApproval && <p id="approval-hint">{t('To continue, approve the masked text or choose “On device only”.','Pro spuštění schvalte maskovaný text nebo zvolte „Pouze v zařízení“.')}</p>}
+        {analysisError && <p role="alert">{t('Analysis failed. Try again or choose on-device processing.','Analýza selhala. Zkuste to znovu nebo vyberte zpracování v zařízení.')}</p>}
+      </section>
     </div>
-  );
+    <div className="wrap vault-lower">
+    {result && <section className="results" id="results"><div className="results-head"><h2 ref={resultHeading} tabIndex={-1}>{t('Analysis result','Výsledek analýzy')}</h2>
+      <button onClick={handleExportCsv}><Download size={16}/>{t('Export CSV','Exportovat CSV')} ({savedBatch.length || 1})</button></div>
+      <p className="subtle">{sourceNames[result.source]} · {result.latencyMs} ms · {t('Estimated cloud cost','Odhad nákladů na cloud')} ${result.estimatedCloudCostUsd.toFixed(4)}</p>
+      <dl className="record-grid">{[[t('Document type','Typ dokumentu'),kinds[result.extracted.documentKind]],[t('Vendor / party','Dodavatel / strana'),result.extracted.vendor],['IČO',result.extracted.ico],
+        [t('Amount','Částka'),[result.extracted.amount,result.extracted.currency].filter(Boolean).join(' ')],[t('Due date','Splatnost'),result.extracted.dueDate],['IBAN',result.extracted.iban]].map(([label,v])=><div key={label}><dt>{label}</dt><dd>{v||'—'}</dd></div>)}</dl>
+      <p>{cs && result.source==='local_deterministic' ? 'Lokální analýza · počet upozornění: '+result.extracted.riskFlags.length+'.' : result.extracted.summary}</p>
+      {!!result.extracted.riskFlags.length && <ul>{result.extracted.riskFlags.map((flag,i)=><li key={i}>{cs ? flagTranslations[flag] || flag : flag}</li>)}</ul>}
+      <details><summary>{t('Processing details and reviewed text','Podrobnosti zpracování a zkontrolovaný text')}</summary><p lang="en">{result.note}</p><pre>{result.redaction.redactedText}</pre></details>
+    </section>}
+    {savedBatch.length>0 && <section className="ledger"><div className="results-head"><h2>{t('Batch','Dávka')} ({savedBatch.length})</h2><button className="secondary" onClick={()=>setSavedBatch([])}>{t('Clear batch','Vyprázdnit dávku')}</button></div>
+      <div className="table-scroll"><table><thead><tr>{[t('Vendor','Dodavatel'),t('Type','Typ'),t('Amount','Částka'),t('Due date','Splatnost')].map(x=><th key={x}>{x}</th>)}</tr></thead><tbody>{savedBatch.map(row=><tr key={row.id}><td>{row.item.vendor}</td><td>{kinds[row.item.documentKind]}</td><td>{row.item.amount??'—'} {row.item.currency}</td><td>{row.item.dueDate??'—'}</td></tr>)}</tbody></table></div></section>}
+    <section id="settings" className="settings"><h2>{t('Settings and access','Nastavení a přístup')}</h2>
+      <details><summary>{t('Processing and privacy','Zpracování a soukromí')}</summary><p>{t('VaultLens masks IBANs, Czech bank accounts, supported Czech personal IDs, emails, phone numbers and common API key formats. Cloud processing uses the reviewed text. The original values are restored in your browser for export.','VaultLens maskuje čísla IBAN, české účty, podporované české osobní identifikátory, e-maily, telefonní čísla a vybrané formáty API klíčů. Cloud zpracovává schválený text. Původní hodnoty se pro export obnoví ve vašem prohlížeči.')}</p>
+      <p>Chrome Nano · {chromeNanoStatus} &nbsp; / &nbsp; Firebase App Check · {appCheckStatus}</p>
+      <button className="secondary" onClick={async()=>{try{await navigator.clipboard.writeText('chrome://flags/#prompt-api-for-gemini-nano');setCopiedFlag(true);setTimeout(()=>setCopiedFlag(false),1800);}catch{setCopiedFlag(false);}}}>{copiedFlag?t('Copied','Zkopírováno'):t('Copy Chrome Nano flag URL','Zkopírovat adresu nastavení Chrome Nano')}</button></details>
+      <div className="setting-row"><div><h3>Firebase AI Logic</h3><p className="subtle">{firebaseConfig?t('Configured','Nakonfigurováno'):t('Optional cloud and on-device models','Volitelné cloudové modely a modely v zařízení')}</p></div><button className="secondary" onClick={openSettings}>{t('Configure','Nastavit')}</button></div>
+      <p>{t('CSV export includes your latest 20 results in this session.','Export CSV obsahuje posledních 20 výsledků v této relaci.')}</p>
+    </section></div></main>
+    <footer className="suite-foot"><div className="wrap"><strong>VaultLens AI</strong><nav><a href={cs?'/faktura-qr/':'/faktura-qr/?lang=en'}>Faktura QR</a><a href={cs?'/eurokyb/':'/eurokyb/en/'}>EuroKYB API</a><a href={hub}>Suite Hub</a><a href="https://github.com/clime-alertviz/vaultlens-hybridai">GitHub</a></nav></div></footer>
+    {showSettings && <Modal title={t('Connect Firebase','Připojení Firebase')} onClose={()=>setShowSettings(false)}>
+      <label htmlFor="cfg">{t('Firebase web app configuration (JSON)','Konfigurace webové aplikace Firebase (JSON)')}</label><p>{t('Copy it from Project Settings. You can include appCheckSiteKey for reCAPTCHA v3 and appCheckDebugToken for development. Configuration is saved in this browser.','Zkopírujte ji z Project Settings. Volitelně přidejte appCheckSiteKey pro reCAPTCHA v3 a appCheckDebugToken pro vývoj. Konfigurace se ukládá do tohoto prohlížeče.')}</p>
+      <textarea id="cfg" rows={6} value={cfgJsonInput} onChange={e=>setCfgJsonInput(e.target.value)}/>{cfgError && <p role="alert">{cfgError}</p>}
+      <div className="actions"><button className="secondary" onClick={()=>setShowSettings(false)}>{t('Cancel','Zrušit')}</button><button onClick={handleSaveConfig}>{t('Save configuration','Uložit konfiguraci')}</button></div></Modal>}
+  </>;
 }
