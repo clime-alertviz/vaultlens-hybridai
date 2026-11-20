@@ -180,3 +180,34 @@ void test('explicit empty and whitespace-only edits never restore document text 
     assert.ok(!output.promptText.includes('private sentence'));
   }
 });
+
+void test('ISDOC 6.0.2 keeps the supplier identity and masks split payment fields before cloud review', async () => {
+  const { DOMParser } = await import('@xmldom/xmldom');
+  const { invoiceXmlText } = await import('./invoiceXml.ts');
+  const supplier = '<i:PartyIdentification><i:ID>00123456</i:ID></i:PartyIdentification>';
+  const xml = `<i:Invoice xmlns:i="http://isdoc.cz/namespace/2013" version="6.0.2">
+    <i:AccountingCustomerParty><i:Party><i:PartyIdentification><i:ID>00876543</i:ID>
+      </i:PartyIdentification></i:Party></i:AccountingCustomerParty>
+    <i:AccountingSupplierParty><i:Party><i:PartyName><i:Name>Test Studio</i:Name></i:PartyName>
+      ${supplier}<i:PartyTaxScheme><i:CompanyID>CZ0123456789</i:CompanyID></i:PartyTaxScheme>
+    </i:Party></i:AccountingSupplierParty>
+    <i:PaymentMeans><i:Payment><i:Details><i:ID>19-24681357</i:ID><i:BankCode>0300</i:BankCode></i:Details>
+    </i:Payment><i:Payment><i:Details><i:ID>987654321</i:ID></i:Details></i:Payment></i:PaymentMeans>
+  </i:Invoice>`;
+  const read = (input: string) => invoiceXmlText(new DOMParser().parseFromString(input, 'application/xml') as unknown as Document);
+  const raw = read(xml);
+  const fields = extractDocumentHeuristics(raw);
+  assert.equal(fields.vendor, 'Test Studio');
+  assert.equal(fields.ico, '00123456');
+  assert.equal(extractDocumentHeuristics(read(xml.replace(supplier, ''))).ico, null);
+  assert.match(raw, /DIČ: CZ0123456789/);
+  assert.match(raw, /Platební účet: 19-24681357\/0300/);
+  const { outboundDocumentText } = prepareCloudSafePrompt({rawText: raw, choice: 'prefer_cloud'});
+  assert.match(outboundDocumentText, /Platební účet: \[CZ_BANK_1\]/);
+  assert.match(outboundDocumentText, /Platební účet: \[CZ_BANK_2\]/);
+  for (const identifier of ['24681357', '987654321', 'CZ0123456789']) {
+    assert.ok(!outboundDocumentText.includes(identifier));
+  }
+  const redaction = redactSensitiveText(raw);
+  assert.equal(restoreRedactedText(redaction.redactedText, redaction.entries), raw);
+});

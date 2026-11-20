@@ -1,3 +1,5 @@
+import { invoiceXmlText } from './invoiceXml.ts';
+
 /** Extract readable text entirely in the browser. No document bytes are uploaded. */
 const maxChars = 500_000;
 
@@ -28,21 +30,5 @@ export async function readDocument(file: File): Promise<string> {
   if (/<!DOCTYPE/i.test(xml)) throw Error('xml');
   const doc = new DOMParser().parseFromString(xml,'application/xml');
   if (doc.getElementsByTagName('parsererror').length) throw Error('xml');
-  const lines:string[] = [];
-  const first = (name:string, parent:Document|Element=doc) => parent.getElementsByTagNameNS('*',name)[0];
-  const supplier = first('AccountingSupplierParty');
-  if (supplier) {
-    const name = first('Name',supplier)?.textContent || first('RegistrationName',supplier)?.textContent;
-    if (name) lines.push(name);
-  }
-  lines.push(doc.documentElement.localName);
-  const labels:Record<string,string>={PayableAmount:'Celkem', PaymentDueDate:'Splatnost', DueDate:'Splatnost', CompanyID:'IČO'};
-  for (const el of doc.getElementsByTagName('*')) {
-    if (!el.childElementCount && el.textContent?.trim()) {
-      const currency = el.localName==='PayableAmount' ? el.getAttribute('currencyID') || first('LocalCurrencyCode')?.textContent || first('DocumentCurrencyCode')?.textContent || '' : '';
-      lines.push((labels[el.localName] || el.localName)+': '+el.textContent.trim()+(currency?' '+currency:''));
-    }
-  }
-  if(lines.length===1) throw Error('xml');
-  return lines.join('\n');
+  return invoiceXmlText(doc);
 }

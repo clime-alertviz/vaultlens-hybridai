@@ -159,6 +159,12 @@ export function redactSensitiveText(input: string): RedactionResult {
   // 1. Mask Secrets first so token contents can't collide with other patterns
   working = working.replace(REGEX_PATTERNS[0]!.regex, (m) => alloc('SECRET', m));
 
+  // Structured invoice fields also identify accounts with a missing or unusual bank code.
+  working = working.replace(/^(Platební účet: )([^\r\n]+)/gm,
+    (_, label: string, account: string) => label + alloc('CZ_BANK', account));
+  working = working.replace(/^(DIČ: )([^\r\n]+)/gm,
+    (_, label: string, taxId: string) => label + alloc('CZ_ID', taxId));
+
   // 2. Mask formatted & compact IBANs via exact country-length aware scanner
   const ibanMatches = findIbanMatches(working);
   if (ibanMatches.length > 0) {
