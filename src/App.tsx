@@ -49,6 +49,14 @@ Internal key sample: sk-test-1234567890abcdef1234`,
   },
 ];
 
+const czechInvoice = `Ukázkové studio s.r.o.
+IČO: 00000000
+Faktura č. 2026-1142
+IBAN: CZ65 0800 0000 1920 0014 5399
+Kontakt: faktury@example.cz
+Splatnost: 2026-12-05
+Celkem: 18 450 CZK`;
+
 const STORAGE_CFG_KEY = 'vaultlens_firebase_cfg_v1';
 
 function Modal({title, onClose, children}: {title: string; onClose: () => void; children: ReactNode}) {
@@ -72,16 +80,16 @@ export function App() {
   }, []);
   useEffect(() => {
     document.documentElement.lang = cs ? 'cs' : 'en';
-    document.title = cs ? 'VaultLens AI · Analýza dokumentů' : 'VaultLens AI · Document analysis';
+    document.title = cs ? 'VaultLens AI · Faktury PDF a XML do CSV' : 'VaultLens AI · PDF and XML invoices to CSV';
   }, [cs]);
   const alternate = new URL(location.href);
   if (cs) alternate.searchParams.set('lang','en'); else alternate.searchParams.delete('lang');
   const [analysisError, setAnalysisError] = useState(false);
-  const [inputText, setInputText] = useState<string>(SAMPLES[0]!.text);
+  const [inputText, setInputText] = useState<string>(() => cs ? czechInvoice : SAMPLES[0]!.text);
   const [routing, setRouting] = useState<RoutingChoice>('strict_local');
   const baseRedaction = useMemo(() => redactSensitiveText(inputText), [inputText]);
   const [preflightDraft, setPreflightDraft] = useState<string>(() =>
-    redactSensitiveText(SAMPLES[0]!.text).redactedText
+    redactSensitiveText(inputText).redactedText
   );
   const [preflightApproved, setPreflightApproved] = useState<boolean>(false);
   const [imageAttachment, setImageAttachment] = useState<{
@@ -138,6 +146,8 @@ export function App() {
   }, [savedConfig]);
 
   useEffect(() => {
+    setResult(null);
+    setAnalysisError(false);
     setPreflightDraft(baseRedaction.redactedText);
     setPreflightApproved(false);
   }, [inputText, baseRedaction.redactedText]);
@@ -298,9 +308,9 @@ export function App() {
     </div></section>
     <div className="wrap desk">
       <section className="panel"><h2><label htmlFor="document">{t('Source document','Zdrojový dokument')}</label></h2>
-        <div className="samples"><span>{t('Samples','Vzory')}</span>{SAMPLES.map((sample,i)=><button type="button" className="secondary" key={sample.label} aria-pressed={inputText===sample.text} disabled={running || reading} onClick={()=>setInputText(sample.text)}>{sampleNames[i]}</button>)}</div>
+        <div className="samples"><span>{t('Samples','Vzory')}</span>{SAMPLES.map((sample,i)=><button type="button" className="secondary" key={sample.label} aria-pressed={inputText===(cs && i===0 ? czechInvoice : sample.text)} disabled={running || reading} onClick={()=>{setInputText(cs && i===0 ? czechInvoice : sample.text);setImageAttachment(null);setImportStatus('');}}>{sampleNames[i]}</button>)}</div>
         <div className="samples"><button className="secondary" disabled={reading || running} onClick={()=>openExample('pdf')}>{t('Try a PDF invoice','Vyzkoušet fakturu PDF')}</button><button className="secondary" disabled={reading || running} onClick={()=>openExample('xml')}>{t('Try an XML invoice','Vyzkoušet fakturu XML')}</button></div>
-        <textarea id="document" rows={10} value={inputText} disabled={running || reading} onChange={e=>setInputText(e.target.value)} spellCheck={false}/>
+        <textarea id="document" rows={10} value={inputText} disabled={running || reading} onChange={e=>{setInputText(e.target.value);setImportStatus('');}} spellCheck={false}/>
         <label className="upload"><Upload size={16}/>{t('Open PDF or XML / ISDOC','Otevřít PDF nebo XML / ISDOC')}<input type="file" accept=".pdf,.xml,.isdoc,application/pdf,text/xml,application/xml" disabled={running||reading} onChange={async e=>{
           const file=e.target.files?.[0]; e.target.value=''; if(!file)return;
           await importFile(file);
